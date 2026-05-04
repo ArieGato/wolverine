@@ -81,6 +81,9 @@ public class concurrent_tick_off_loss : PostgresqlContext
     {
         TickOffSaga.HandleInvocationCount = 0;
         TickOffSaga.HandleEarlyReturnCount = 0;
+        marten_update_revision_probe.PendingOperationsLogger.Captured.Clear();
+        marten_update_revision_probe.PendingOperationsLogger.BeforeSaveCount = 0;
+        marten_update_revision_probe.PendingOperationsLogger.AfterCommitCount = 0;
 
         using var host = await BuildHostAsync(useMessagePartitioning: false);
 
@@ -91,6 +94,22 @@ public class concurrent_tick_off_loss : PostgresqlContext
         _output.WriteLine($"  of which early-returned:     {TickOffSaga.HandleEarlyReturnCount}");
         _output.WriteLine($"Registered (Completed.Count):  {registered}");
         _output.WriteLine($"Lost mutations:                {lost}");
+
+        var captures = marten_update_revision_probe.PendingOperationsLogger.Captured.ToArray();
+        var byType = captures
+            .GroupBy(c => c)
+            .OrderByDescending(g => g.Count())
+            .Select(g => $"  {g.Count()}x: {g.Key}")
+            .ToArray();
+        _output.WriteLine($"Pending-op snapshots captured: {captures.Length}");
+        _output.WriteLine($"BeforeSaveChangesAsync count:  {marten_update_revision_probe.PendingOperationsLogger.BeforeSaveCount}");
+        _output.WriteLine($"AfterCommitAsync count:        {marten_update_revision_probe.PendingOperationsLogger.AfterCommitCount}");
+        foreach (var line in byType.Take(20))
+        {
+            _output.WriteLine(line);
+        }
+        // Also dump to a stable file so the captures survive xUnit's per-line truncation.
+        System.IO.File.WriteAllLines("/tmp/pending_ops_capture.txt", captures);
 
         // The bug: with parallel tick-offs against a single saga, some mutations are
         // silently lost. The retry policy never fires the rescheduled retry that would
@@ -120,11 +139,20 @@ public class concurrent_tick_off_loss : PostgresqlContext
             {
                 opts.Services.AddMarten(m =>
                 {
+                    // Npgsql logging is intentionally enabled so this run logs
+                    // every UPDATE/INSERT against the saga table. We grep the
+                    // log for `update tick_off_loss.mt_doc_tickoffsaga` to see
+                    // how many actual SQL UPDATEs reach the database vs. how
+                    // many handler invocations Wolverine logs as successful.
                     m.DisableNpgsqlLogging = true;
                     m.Connection(Servers.PostgresConnectionString);
                     m.DatabaseSchemaName = "tick_off_loss";
                     m.AutoCreateSchemaObjects = AutoCreate.CreateOrUpdate;
-                    m.Schema.For<TickOffSaga>().UseNumericRevisions(true);
+                    m.Listeners.Add(new marten_update_revision_probe.PendingOperationsLogger());
+                    // Do NOT call UseNumericRevisions here — Wolverine.Marten's
+                    // MartenIntegration sets it automatically for all Saga types
+                    // and also pins the revision member to Saga.Version. Setting
+                    // it manually is redundant and risks fighting with that policy.
                 }).IntegrateWithWolverine();
 
                 opts.Services.AddResourceSetupOnStartup();
@@ -135,12 +163,12 @@ public class concurrent_tick_off_loss : PostgresqlContext
                 opts.Policies.UseDurableInboxOnAllListeners();
                 opts.Policies.UseDurableOutboxOnAllSendingEndpoints();
 
-                // Differential probe: NO retries, straight to DLQ on first
-                // ConcurrencyException. If the policy is seeing the exception at
-                // all, all 45+ losers should land in wolverine_dead_letters.
-                opts.Policies
-                    .OnException<JasperFx.ConcurrencyException>()
-                    .MoveToErrorQueue();
+                // Differential probe: catch ANY exception (not just
+                // ConcurrencyException) and move it straight to DLQ. If the
+                // ConcurrencyException-typed policy was missing some failures
+                // because they throw a different type, this catch-all should
+                // route every contended commit to the DLQ.
+                opts.Policies.OnAnyException().MoveToErrorQueue();
 
                 if (useMessagePartitioning)
                 {
@@ -321,6 +349,449 @@ public class marten_update_revision_probe : PostgresqlContext
         // If it didn't, Marten silently overwrote A's mutation — and that would be the
         // direct mechanism for the saga state loss we observe in production.
         caught.ShouldBeOfType<JasperFx.ConcurrencyException>();
+    }
+
+    [Fact(DisplayName = "PROBE: after load, does saga.Version == mt_version (Marten metadata) or == data.Version (stale in JSON)?")]
+    public async Task saga_version_after_load_matches_mt_version_or_data_version()
+    {
+        var store = DocumentStore.For(opts =>
+        {
+            opts.Connection(Servers.PostgresConnectionString);
+            opts.DatabaseSchemaName = "tick_off_loss_probe";
+            opts.AutoCreateSchemaObjects = AutoCreate.All;
+            opts.Schema.For<TickOffSaga>().UseNumericRevisions(true);
+        });
+
+        var sagaId = Guid.NewGuid();
+
+        // Insert at v=1 (initial), then perform 3 successful UpdateRevision commits
+        // sequentially. After this, mt_version should be 4. What's saga.Version on
+        // a fresh load?
+        await using (var s = store.LightweightSession())
+        {
+            s.Insert(new TickOffSaga
+            {
+                Id = sagaId,
+                Outstanding = [.. Enumerable.Range(0, 10)],
+                Completed = [],
+                TotalTicks = 10,
+            });
+            await s.SaveChangesAsync();
+        }
+        for (var i = 0; i < 3; i++)
+        {
+            await using var s = store.LightweightSession();
+            var saga = await s.LoadAsync<TickOffSaga>(sagaId);
+            saga!.Outstanding.Remove(i);
+            saga.Completed.Add(i);
+            s.UpdateRevision(saga, saga.Version + 1);
+            await s.SaveChangesAsync();
+        }
+
+        // Now a fresh load: read saga.Version directly.
+        await using var inspect = store.LightweightSession();
+        var loaded = await inspect.LoadAsync<TickOffSaga>(sagaId);
+
+        // Read mt_version directly from the DB.
+        var conn = inspect.Connection!;
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "select mt_version, data->>'Version' as data_version from tick_off_loss_probe.mt_doc_tickoffsaga where id = @id";
+        var p = cmd.CreateParameter();
+        p.ParameterName = "id";
+        p.Value = sagaId;
+        cmd.Parameters.Add(p);
+        await using var reader = await cmd.ExecuteReaderAsync();
+        await reader.ReadAsync();
+        var mtVersion = reader.GetInt32(0);
+        var dataVersion = reader.GetString(1);
+
+        _output.WriteLine($"loaded.Version (in-memory after load): {loaded!.Version}");
+        _output.WriteLine($"mt_version (Marten revision column):  {mtVersion}");
+        _output.WriteLine($"data.Version (JSON property):         {dataVersion}");
+
+        // The bug-or-not check: if loaded.Version != mt_version, then a parallel
+        // handler that computes expectedSagaRevision = loaded.Version + 1 will
+        // be requesting a revision that is ALREADY THE STORED VALUE — so the
+        // UpdateRevision either silently no-ops (if Marten's WHERE is `<=`) or
+        // throws ConcurrencyException without an actual contention.
+        loaded.Version.ShouldBe(mtVersion);
+    }
+
+    [Fact(DisplayName = "PROBE: failing UpdateRevision in a batch with a raw SQL UPDATE — does the raw SQL persist when UpdateRevision is a no-op?")]
+    public async Task raw_sql_command_persists_even_when_update_revision_no_ops()
+    {
+        // This probe mimics what Wolverine.Marten's FlushOutgoingMessagesOnCommit
+        // session listener does: it queues a raw SQL UPDATE on the SAME session
+        // alongside the saga's UpdateRevision. If Marten's batch commits the tx
+        // BEFORE checking rowcounts and throwing ConcurrencyException, then the
+        // raw SQL UPDATE could persist while the saga stays untouched — and the
+        // exception (if any) reaches the caller AFTER the commit.
+
+        var store = DocumentStore.For(opts =>
+        {
+            opts.Connection(Servers.PostgresConnectionString);
+            opts.DatabaseSchemaName = "tick_off_loss_probe";
+            opts.AutoCreateSchemaObjects = AutoCreate.All;
+            opts.Schema.For<TickOffSaga>().UseNumericRevisions(true);
+        });
+
+        var sagaId = Guid.NewGuid();
+        await using (var seed = store.LightweightSession())
+        {
+            seed.Insert(new TickOffSaga
+            {
+                Id = sagaId,
+                Outstanding = [1, 2],
+                Completed = [],
+                TotalTicks = 2,
+            });
+            await seed.SaveChangesAsync();
+        }
+
+        // Create the side-effect table with a dedicated connection (Marten's
+        // QueueSqlCommand rejects multi-statement SQL, so we can't piggy-back).
+        await using (var ddlConn = new Npgsql.NpgsqlConnection(Servers.PostgresConnectionString))
+        {
+            await ddlConn.OpenAsync();
+            await using var ddl1 = ddlConn.CreateCommand();
+            ddl1.CommandText = "create table if not exists tick_off_loss_probe.probe_marker(id uuid primary key, marked_at timestamptz not null)";
+            await ddl1.ExecuteNonQueryAsync();
+            await using var ddl2 = ddlConn.CreateCommand();
+            ddl2.CommandText = "delete from tick_off_loss_probe.probe_marker";
+            await ddl2.ExecuteNonQueryAsync();
+        }
+
+        // Bump the saga's stored revision to 2 BEFORE we open the test session,
+        // so our test session's UpdateRevision(saga, 2) is guaranteed to be a
+        // no-op (stored 2, attempting 2 → WHERE 2 < 2 is false, 0 rows updated).
+        await using (var bump = store.LightweightSession())
+        {
+            var s = await bump.LoadAsync<TickOffSaga>(sagaId);
+            s!.Completed.Add(99);
+            bump.UpdateRevision(s, s.Version + 1);
+            await bump.SaveChangesAsync();
+        }
+
+        var probeMarkerId = Guid.NewGuid();
+
+        await using var session = store.LightweightSession();
+        var saga = await session.LoadAsync<TickOffSaga>(sagaId);
+        saga!.Version.ShouldBe(2);
+
+        // Mutate locally and queue UpdateRevision targeting expected=2 — will
+        // be a no-op because stored is already 2 (we bumped it above).
+        saga.Outstanding.Remove(1);
+        saga.Completed.Add(1);
+        session.UpdateRevision(saga, 2);
+
+        // Queue a raw SQL UPDATE in the SAME batch — this is what
+        // FlushOutgoingMessagesOnCommit.BeforeSaveChangesAsync does.
+        session.QueueSqlCommand(
+            "insert into tick_off_loss_probe.probe_marker(id, marked_at) values (?, now());",
+            probeMarkerId);
+
+        Exception? caught = null;
+        try
+        {
+            await session.SaveChangesAsync();
+        }
+        catch (Exception ex)
+        {
+            caught = ex;
+        }
+
+        _output.WriteLine($"SaveChanges threw: {caught?.GetType().FullName ?? "<no exception>"}");
+        if (caught is not null)
+        {
+            _output.WriteLine($"Message: {caught.Message}");
+        }
+
+        // Now inspect: did the raw SQL persist anyway?
+        await using var inspect = store.LightweightSession();
+        var conn = inspect.Connection!;
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "select count(*) from tick_off_loss_probe.probe_marker where id = @id";
+        var p = cmd.CreateParameter();
+        p.ParameterName = "id";
+        p.Value = probeMarkerId;
+        cmd.Parameters.Add(p);
+        var probeRow = await cmd.ExecuteScalarAsync();
+        var rowCount = Convert.ToInt32(probeRow);
+
+        _output.WriteLine($"Raw SQL UPDATE persisted: {rowCount > 0}");
+        _output.WriteLine($"Saga still at version 2 (unchanged): {(await inspect.LoadAsync<TickOffSaga>(sagaId))!.Version == 2}");
+
+        // The hypothesis under test: when UpdateRevision is a no-op AND a raw
+        // SQL command was queued in the same batch, the raw SQL MUST be rolled
+        // back together with the failed UpdateRevision. If the raw SQL persists,
+        // that is a Marten batching bug and likely the saga loss mechanism.
+        rowCount.ShouldBe(0);
+        caught.ShouldBeOfType<JasperFx.ConcurrencyException>();
+    }
+
+    [Fact(DisplayName = "PROBE: failing UpdateRevision with raw SQL queued from a session listener BeforeSaveChangesAsync — does the listener's SQL persist?")]
+    public async Task raw_sql_command_queued_from_session_listener_persists_when_update_revision_fails()
+    {
+        // Mirrors what Wolverine.Marten's FlushOutgoingMessagesOnCommit does:
+        // it queues a raw SQL UPDATE inside the session-listener's
+        // BeforeSaveChangesAsync hook, NOT inline before SaveChanges. If
+        // listener-queued raw SQL is dispatched as a separate transaction
+        // (or otherwise outside the batch that contains UpdateRevision),
+        // it could persist even when UpdateRevision is a no-op.
+
+        var store = DocumentStore.For(opts =>
+        {
+            opts.Connection(Servers.PostgresConnectionString);
+            opts.DatabaseSchemaName = "tick_off_loss_probe";
+            opts.AutoCreateSchemaObjects = AutoCreate.All;
+            opts.Schema.For<TickOffSaga>().UseNumericRevisions(true);
+        });
+
+        var sagaId = Guid.NewGuid();
+        await using (var seed = store.LightweightSession())
+        {
+            seed.Insert(new TickOffSaga
+            {
+                Id = sagaId,
+                Outstanding = [1, 2],
+                Completed = [],
+                TotalTicks = 2,
+            });
+            await seed.SaveChangesAsync();
+        }
+
+        await using (var ddlConn = new Npgsql.NpgsqlConnection(Servers.PostgresConnectionString))
+        {
+            await ddlConn.OpenAsync();
+            await using var ddl1 = ddlConn.CreateCommand();
+            ddl1.CommandText = "create table if not exists tick_off_loss_probe.probe_marker(id uuid primary key, marked_at timestamptz not null)";
+            await ddl1.ExecuteNonQueryAsync();
+            await using var ddl2 = ddlConn.CreateCommand();
+            ddl2.CommandText = "delete from tick_off_loss_probe.probe_marker";
+            await ddl2.ExecuteNonQueryAsync();
+        }
+
+        // Bump stored to 2 so our test session's UpdateRevision(saga, 2) fails.
+        await using (var bump = store.LightweightSession())
+        {
+            var s = await bump.LoadAsync<TickOffSaga>(sagaId);
+            s!.Completed.Add(99);
+            bump.UpdateRevision(s, s.Version + 1);
+            await bump.SaveChangesAsync();
+        }
+
+        var probeMarkerId = Guid.NewGuid();
+
+        await using var session = store.LightweightSession();
+        // Attach a listener that queues a raw SQL INSERT in BeforeSaveChangesAsync —
+        // mirroring FlushOutgoingMessagesOnCommit.BeforeSaveChangesAsync.
+        session.Listeners.Add(new InsertProbeMarkerOnBeforeSave(probeMarkerId));
+
+        var saga = await session.LoadAsync<TickOffSaga>(sagaId);
+        saga!.Version.ShouldBe(2);
+        saga.Outstanding.Remove(1);
+        saga.Completed.Add(1);
+        session.UpdateRevision(saga, 2);
+
+        Exception? caught = null;
+        try
+        {
+            await session.SaveChangesAsync();
+        }
+        catch (Exception ex)
+        {
+            caught = ex;
+        }
+
+        _output.WriteLine($"SaveChanges threw: {caught?.GetType().FullName ?? "<no exception>"}");
+
+        await using var inspect = store.LightweightSession();
+        var conn = inspect.Connection!;
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "select count(*) from tick_off_loss_probe.probe_marker where id = @id";
+        var p = cmd.CreateParameter();
+        p.ParameterName = "id";
+        p.Value = probeMarkerId;
+        cmd.Parameters.Add(p);
+        var rowCount = Convert.ToInt32(await cmd.ExecuteScalarAsync());
+
+        _output.WriteLine($"Listener-queued raw SQL persisted: {rowCount > 0}");
+        _output.WriteLine($"Saga still at version 2 (unchanged): {(await inspect.LoadAsync<TickOffSaga>(sagaId))!.Version == 2}");
+
+        // Hypothesis: listener-queued raw SQL must roll back along with
+        // UpdateRevision. If it persists, that's the saga loss mechanism.
+        rowCount.ShouldBe(0);
+        caught.ShouldBeOfType<JasperFx.ConcurrencyException>();
+    }
+
+    /// <summary>
+    /// Document listener that captures, in <see cref="BeforeSaveChangesAsync"/>,
+    /// the type and revision-property (if any) of every pending storage
+    /// operation queued on the session. Used to verify whether the saga handler's
+    /// session actually has an UpdateRevision-style op queued at SaveChanges
+    /// time, or whether the op vanished / mutated into something else.
+    /// </summary>
+    public sealed class PendingOperationsLogger : Marten.DocumentSessionListenerBase
+    {
+        public static readonly System.Collections.Concurrent.ConcurrentBag<string> Captured = new();
+        public static int BeforeSaveCount;
+        public static int AfterCommitCount;
+
+        public override Task BeforeSaveChangesAsync(IDocumentSession session, CancellationToken token)
+        {
+            Interlocked.Increment(ref BeforeSaveCount);
+            var ops = session.PendingChanges.Operations().ToArray();
+            var summary = $"OPS_COUNT={ops.Length} | " +
+                string.Join(" || ", ops.Select(o =>
+                {
+                    var t = o.GetType();
+                    var revisionProp = t.GetProperty("Revision");
+                    var revisionVal = revisionProp?.GetValue(o);
+                    var docTypeProp = t.GetProperty("DocumentType");
+                    var docTypeVal = docTypeProp?.GetValue(o);
+                    return $"{t.Name}(DocType={docTypeVal?.ToString()?.Split('.').Last() ?? "?"}, Revision={revisionVal?.ToString() ?? "?"})";
+                }));
+            Captured.Add(summary);
+            return Task.CompletedTask;
+        }
+
+        public override Task AfterCommitAsync(IDocumentSession session, Marten.Services.IChangeSet commit, CancellationToken token)
+        {
+            Interlocked.Increment(ref AfterCommitCount);
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class InsertProbeMarkerOnBeforeSave : Marten.DocumentSessionListenerBase
+    {
+        private readonly Guid _markerId;
+
+        public InsertProbeMarkerOnBeforeSave(Guid markerId)
+        {
+            _markerId = markerId;
+        }
+
+        public override Task BeforeSaveChangesAsync(IDocumentSession session, CancellationToken token)
+        {
+            session.QueueSqlCommand(
+                "insert into tick_off_loss_probe.probe_marker(id, marked_at) values (?, now())",
+                _markerId);
+            return Task.CompletedTask;
+        }
+    }
+
+    [Fact(DisplayName = "PROBE: stress mt_upsert race — does AfterCommit ever exceed actual UPDATEs?")]
+    public async Task mt_upsert_race_under_load_can_silently_succeed_without_persisting()
+    {
+        // Goal: demonstrate (or rule out) that Marten's mt_upsert_<sagaType>
+        // function can return non-zero (and therefore make Marten fire
+        // AfterCommitAsync) for a SaveChanges that did NOT actually update the
+        // row. The function reads current_version, then runs INSERT…ON
+        // CONFLICT…DO UPDATE WHERE revision > mt_version, then SELECTs
+        // final_version. If a concurrent tx bumps mt_version between the
+        // first SELECT and the ON CONFLICT WHERE, the UPDATE silently
+        // skips while final_version is read as the concurrently-bumped
+        // value — non-zero, no error.
+        //
+        // This is a standalone Marten probe. Wolverine is not in the loop.
+
+        const int Parallelism = 50;
+        const int Iterations = 5;
+
+        var listener = new PendingOperationsLogger();
+        var store = DocumentStore.For(opts =>
+        {
+            opts.Connection(Servers.PostgresConnectionString);
+            opts.DatabaseSchemaName = "tick_off_loss_probe";
+            opts.AutoCreateSchemaObjects = AutoCreate.All;
+            opts.Schema.For<TickOffSaga>().UseNumericRevisions(true);
+            opts.Listeners.Add(listener);
+        });
+
+        for (var iter = 0; iter < Iterations; iter++)
+        {
+            // Fresh saga per iteration so each iteration has the same starting
+            // condition (a saga at v=1 with N outstanding indices).
+            var sagaId = Guid.NewGuid();
+            await using (var seed = store.LightweightSession())
+            {
+                seed.Insert(new TickOffSaga
+                {
+                    Id = sagaId,
+                    Outstanding = [.. Enumerable.Range(0, Parallelism)],
+                    Completed = [],
+                    TotalTicks = Parallelism,
+                });
+                await seed.SaveChangesAsync();
+            }
+
+            PendingOperationsLogger.BeforeSaveCount = 0;
+            PendingOperationsLogger.AfterCommitCount = 0;
+
+            // All N sessions load the saga at v=1 sequentially so they ALL see
+            // the same starting Version=1 and request expectedRevision=2.
+            var sessions = new IDocumentSession[Parallelism];
+            for (var i = 0; i < Parallelism; i++)
+            {
+                sessions[i] = store.LightweightSession();
+                var s = (await sessions[i].LoadAsync<TickOffSaga>(sagaId))!;
+                s.Version.ShouldBe(1);
+                s.Outstanding.Remove(i);
+                s.Completed.Add(i);
+                sessions[i].UpdateRevision(s, 2);
+            }
+
+            // Race the SaveChanges in parallel. Mimic Wolverine's per-handler
+            // jitter (Task.Delay before save) so the race window between the
+            // function's first SELECT and its ON CONFLICT WHERE is exercised.
+            var results = new (int Index, Exception? Error)[Parallelism];
+            await Parallel.ForEachAsync(
+                Enumerable.Range(0, Parallelism),
+                new ParallelOptions { MaxDegreeOfParallelism = Parallelism },
+                async (i, ct) =>
+                {
+                    try
+                    {
+                        await Task.Delay(Random.Shared.Next(0, 10), ct);
+                        await sessions[i].SaveChangesAsync(ct);
+                        results[i] = (i, null);
+                    }
+                    catch (Exception ex)
+                    {
+                        results[i] = (i, ex);
+                    }
+                });
+
+            for (var i = 0; i < Parallelism; i++)
+            {
+                await sessions[i].DisposeAsync();
+            }
+
+            // Inspect actual saga state.
+            await using var inspect = store.LightweightSession();
+            var final = await inspect.LoadAsync<TickOffSaga>(sagaId);
+
+            var successes = results.Count(r => r.Error is null);
+            var concurrencyFailures = results.Count(r => r.Error is JasperFx.ConcurrencyException);
+            var actualMutations = final!.Completed.Count;
+            var beforeSave = PendingOperationsLogger.BeforeSaveCount;
+            var afterCommit = PendingOperationsLogger.AfterCommitCount;
+
+            _output.WriteLine(
+                $"iter={iter}: SaveChanges successes={successes}, ConcurrencyExceptions={concurrencyFailures}, " +
+                $"BeforeSave={beforeSave}, AfterCommit={afterCommit}, actual saga mutations={actualMutations}, " +
+                $"final mt_version={final.Version}");
+
+            // The hypothesis under test: AfterCommit > actualMutations means
+            // Marten's SaveChanges reported success for a SaveChanges that
+            // did not actually persist. If this happens at the bare-Marten
+            // level, that confirms the race is in mt_upsert_*, not in
+            // Wolverine's saga handler chain.
+            if (afterCommit > actualMutations)
+            {
+                _output.WriteLine($"  *** RACE REPRODUCED at the bare Marten level: AfterCommit={afterCommit}, actual mutations={actualMutations} ***");
+            }
+        }
     }
 
     [Fact(DisplayName = "PROBE: N concurrent UpdateRevision(doc, 2) — exactly one wins, the rest throw ConcurrencyException")]
