@@ -10,6 +10,8 @@ using Shouldly;
 using Wolverine;
 using Wolverine.ErrorHandling;
 using Wolverine.Marten;
+using Wolverine.Runtime;
+using Wolverine.Runtime.Handlers;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -50,16 +52,45 @@ public class concurrent_tick_off_loss : PostgresqlContext
         _output = output;
     }
 
+    [Fact(DisplayName = "DUMP: print the generated TickOff saga handler source")]
+    public async Task dump_generated_handler_source()
+    {
+        using var host = await BuildHostAsync(useMessagePartitioning: false);
+
+        var runtime = (WolverineRuntime)host.Services.GetRequiredService<IWolverineRuntime>();
+        var graph = runtime.Handlers;
+
+        // Force compile by resolving handlers — SourceCode is null until the chain compiles.
+        var tickOffHandler = (MessageHandler)graph.HandlerFor<TickOff>()!;
+        var startHandler = (MessageHandler)graph.HandlerFor<StartTickOffSaga>()!;
+
+        var dumpPath = "/tmp/tick_off_saga_handler_codegen.txt";
+        using var writer = new StreamWriter(dumpPath);
+
+        writer.WriteLine($"=== Chain for {startHandler.Chain!.MessageType.FullName} ===");
+        writer.WriteLine(startHandler.Chain.SourceCode ?? "<no source>");
+        writer.WriteLine();
+        writer.WriteLine($"=== Chain for {tickOffHandler.Chain!.MessageType.FullName} ===");
+        writer.WriteLine(tickOffHandler.Chain.SourceCode ?? "<no source>");
+        writer.WriteLine();
+        _output.WriteLine($"Wrote {dumpPath}");
+    }
+
     [Fact(DisplayName = "BUG: parallel tick-offs against a single revisioned saga silently drop mutations")]
     public async Task parallel_tick_offs_silently_lose_mutations()
     {
+        TickOffSaga.HandleInvocationCount = 0;
+        TickOffSaga.HandleEarlyReturnCount = 0;
+
         using var host = await BuildHostAsync(useMessagePartitioning: false);
 
         var (sagaId, registered, lost) = await DriveSagaAsync(host);
 
-        _output.WriteLine($"Tick count: {TickCount}");
-        _output.WriteLine($"Registered (Completed.Count): {registered}");
-        _output.WriteLine($"Lost mutations:                 {lost}");
+        _output.WriteLine($"Tick count:                    {TickCount}");
+        _output.WriteLine($"Handle invocations:            {TickOffSaga.HandleInvocationCount}");
+        _output.WriteLine($"  of which early-returned:     {TickOffSaga.HandleEarlyReturnCount}");
+        _output.WriteLine($"Registered (Completed.Count):  {registered}");
+        _output.WriteLine($"Lost mutations:                {lost}");
 
         // The bug: with parallel tick-offs against a single saga, some mutations are
         // silently lost. The retry policy never fires the rescheduled retry that would
@@ -104,14 +135,12 @@ public class concurrent_tick_off_loss : PostgresqlContext
                 opts.Policies.UseDurableInboxOnAllListeners();
                 opts.Policies.UseDurableOutboxOnAllSendingEndpoints();
 
-                // Same retry shape as the affected production service: an explicit
-                // ConcurrencyException policy with a finite inline budget falling back
-                // to ScheduleRetryIndefinitely.
+                // Differential probe: NO retries, straight to DLQ on first
+                // ConcurrencyException. If the policy is seeing the exception at
+                // all, all 45+ losers should land in wolverine_dead_letters.
                 opts.Policies
                     .OnException<JasperFx.ConcurrencyException>()
-                    .RetryWithCooldown(
-                        50.Milliseconds(), 100.Milliseconds(), 200.Milliseconds(), 400.Milliseconds())
-                    .Then.ScheduleRetryIndefinitely(1.Seconds(), 2.Seconds(), 4.Seconds());
+                    .MoveToErrorQueue();
 
                 if (useMessagePartitioning)
                 {
@@ -203,6 +232,192 @@ public class concurrent_tick_off_loss : PostgresqlContext
     }
 }
 
+/// <summary>
+/// Empirical probes for Marten's <c>UpdateRevision</c> semantics under contention.
+/// Wolverine is not involved here — this drives Marten directly to confirm that
+/// <c>UpdateRevision(doc, expected)</c> does in fact throw <see cref="JasperFx.ConcurrencyException"/>
+/// when the stored revision has already moved past <c>expected - 1</c>.
+/// </summary>
+public class marten_update_revision_probe : PostgresqlContext
+{
+    private readonly ITestOutputHelper _output;
+
+    public marten_update_revision_probe(ITestOutputHelper output)
+    {
+        _output = output;
+    }
+
+    [Fact(DisplayName = "PROBE: two concurrent UpdateRevision(doc, 2) — second commit must throw ConcurrencyException")]
+    public async Task two_concurrent_update_revisions_against_same_expected_version()
+    {
+        var store = DocumentStore.For(opts =>
+        {
+            opts.Connection(Servers.PostgresConnectionString);
+            opts.DatabaseSchemaName = "tick_off_loss_probe";
+            opts.AutoCreateSchemaObjects = AutoCreate.All;
+            opts.Schema.For<TickOffSaga>().UseNumericRevisions(true);
+        });
+
+        var sagaId = Guid.NewGuid();
+
+        // Seed a saga at version 1.
+        await using (var seed = store.LightweightSession())
+        {
+            seed.Insert(new TickOffSaga
+            {
+                Id = sagaId,
+                Outstanding = [1, 2],
+                Completed = [],
+                TotalTicks = 2,
+            });
+            await seed.SaveChangesAsync();
+        }
+
+        // Two sessions both load v=1, both call UpdateRevision(doc, 2). The first
+        // SaveChanges should win and bump stored to v=2. The second SaveChanges must
+        // throw ConcurrencyException — if Marten silently no-ops here, that is the bug.
+        await using var sessionA = store.LightweightSession();
+        await using var sessionB = store.LightweightSession();
+
+        var sagaA = await sessionA.LoadAsync<TickOffSaga>(sagaId);
+        var sagaB = await sessionB.LoadAsync<TickOffSaga>(sagaId);
+
+        sagaA.ShouldNotBeNull();
+        sagaB.ShouldNotBeNull();
+        sagaA!.Version.ShouldBe(1);
+        sagaB!.Version.ShouldBe(1);
+
+        sagaA.Completed.Add(1);
+        sagaA.Outstanding.Remove(1);
+        sagaB.Completed.Add(2);
+        sagaB.Outstanding.Remove(2);
+
+        sessionA.UpdateRevision(sagaA, sagaA.Version + 1);
+        sessionB.UpdateRevision(sagaB, sagaB.Version + 1);
+
+        await sessionA.SaveChangesAsync();
+        _output.WriteLine($"After A commit: stored Version expected = 2");
+
+        Exception? caught = null;
+        try
+        {
+            await sessionB.SaveChangesAsync();
+        }
+        catch (Exception ex)
+        {
+            caught = ex;
+        }
+
+        _output.WriteLine($"Session B SaveChanges result: {(caught is null ? "NO EXCEPTION (silent no-op!)" : caught.GetType().FullName + ": " + caught.Message)}");
+
+        // Inspect final state.
+        await using var inspect = store.LightweightSession();
+        var final = await inspect.LoadAsync<TickOffSaga>(sagaId);
+        _output.WriteLine($"Final saga Version: {final!.Version}");
+        _output.WriteLine($"Final Completed:   [{string.Join(",", final.Completed)}]");
+        _output.WriteLine($"Final Outstanding: [{string.Join(",", final.Outstanding)}]");
+
+        // The assertion that pins down the bug: B MUST have thrown ConcurrencyException.
+        // If it didn't, Marten silently overwrote A's mutation — and that would be the
+        // direct mechanism for the saga state loss we observe in production.
+        caught.ShouldBeOfType<JasperFx.ConcurrencyException>();
+    }
+
+    [Fact(DisplayName = "PROBE: N concurrent UpdateRevision(doc, 2) — exactly one wins, the rest throw ConcurrencyException")]
+    public async Task n_concurrent_update_revisions_against_same_expected_version()
+    {
+        const int Parallelism = 32;
+
+        var store = DocumentStore.For(opts =>
+        {
+            opts.Connection(Servers.PostgresConnectionString);
+            opts.DatabaseSchemaName = "tick_off_loss_probe";
+            opts.AutoCreateSchemaObjects = AutoCreate.All;
+            opts.Schema.For<TickOffSaga>().UseNumericRevisions(true);
+        });
+
+        var sagaId = Guid.NewGuid();
+        await using (var seed = store.LightweightSession())
+        {
+            seed.Insert(new TickOffSaga
+            {
+                Id = sagaId,
+                Outstanding = [.. Enumerable.Range(0, Parallelism)],
+                Completed = [],
+                TotalTicks = Parallelism,
+            });
+            await seed.SaveChangesAsync();
+        }
+
+        // All N sessions load v=1 first (synchronously, sequentially), so they ALL hold a
+        // snapshot at version 1 and will ALL try to UpdateRevision(saga, 2). Then we
+        // SaveChanges in parallel. Exactly one should win and bump stored to v=2; the
+        // other N-1 must throw ConcurrencyException. If any of them silently succeed
+        // without throwing, that is the loss mechanism.
+        var sessions = new IDocumentSession[Parallelism];
+        var sagas = new TickOffSaga[Parallelism];
+        for (var i = 0; i < Parallelism; i++)
+        {
+            sessions[i] = store.LightweightSession();
+            sagas[i] = (await sessions[i].LoadAsync<TickOffSaga>(sagaId))!;
+            sagas[i].Version.ShouldBe(1);
+            sagas[i].Outstanding.Remove(i);
+            sagas[i].Completed.Add(i);
+            sessions[i].UpdateRevision(sagas[i], sagas[i].Version + 1);
+        }
+
+        var results = new (int Index, Exception? Error)[Parallelism];
+        await Parallel.ForEachAsync(
+            Enumerable.Range(0, Parallelism),
+            new ParallelOptions { MaxDegreeOfParallelism = Parallelism },
+            async (i, ct) =>
+            {
+                try
+                {
+                    await sessions[i].SaveChangesAsync(ct);
+                    results[i] = (i, null);
+                }
+                catch (Exception ex)
+                {
+                    results[i] = (i, ex);
+                }
+            });
+
+        for (var i = 0; i < Parallelism; i++)
+        {
+            await sessions[i].DisposeAsync();
+        }
+
+        var successes = results.Count(r => r.Error is null);
+        var concurrencyFailures = results.Count(r => r.Error is JasperFx.ConcurrencyException);
+        var otherFailures = results
+            .Where(r => r.Error is not null and not JasperFx.ConcurrencyException)
+            .Select(r => $"#{r.Index}: {r.Error!.GetType().FullName}: {r.Error.Message}")
+            .ToArray();
+
+        _output.WriteLine($"Parallelism: {Parallelism}");
+        _output.WriteLine($"Successes: {successes}");
+        _output.WriteLine($"ConcurrencyExceptions: {concurrencyFailures}");
+        _output.WriteLine($"Other failures: {otherFailures.Length}");
+        foreach (var msg in otherFailures.Take(5))
+        {
+            _output.WriteLine($"  {msg}");
+        }
+
+        await using var inspect = store.LightweightSession();
+        var final = await inspect.LoadAsync<TickOffSaga>(sagaId);
+        _output.WriteLine($"Final saga Version:  {final!.Version}");
+        _output.WriteLine($"Final Completed:     [{string.Join(",", final.Completed.OrderBy(x => x))}]");
+        _output.WriteLine($"Final Outstanding:   [{string.Join(",", final.Outstanding.OrderBy(x => x))}]");
+
+        successes.ShouldBe(1);
+        concurrencyFailures.ShouldBe(Parallelism - 1);
+        otherFailures.ShouldBeEmpty();
+        final.Version.ShouldBe(2);
+        final.Completed.Count.ShouldBe(1);
+    }
+}
+
 /// <summary>Common surface for the saga's messages so MessagePartitioning can derive the
 /// group id (saga id) without relying on a <c>[SagaIdentity]</c> attribute or convention.</summary>
 public interface ITickOffSagaMessage
@@ -225,6 +440,13 @@ public sealed record TickOff(Guid SagaId, int Index) : ITickOffSagaMessage;
 /// </summary>
 public class TickOffSaga : Wolverine.Saga, Marten.Metadata.IRevisioned
 {
+    /// <summary>Counts how many times <see cref="Handle"/> is actually invoked
+    /// across all instances in the current process. If only 22 of 50 invocations
+    /// happen, we know envelopes are being dropped before reaching the handler.</summary>
+    public static int HandleInvocationCount;
+
+    public static int HandleEarlyReturnCount;
+
     public Guid Id { get; set; }
 
     public HashSet<int> Outstanding { get; set; } = [];
@@ -233,8 +455,6 @@ public class TickOffSaga : Wolverine.Saga, Marten.Metadata.IRevisioned
 
     public int TotalTicks { get; set; }
 
-    public List<TickPayload> Payload { get; set; } = [];
-
     public static (TickOffSaga, OutgoingMessages) Start(StartTickOffSaga message)
     {
         var saga = new TickOffSaga
@@ -242,18 +462,14 @@ public class TickOffSaga : Wolverine.Saga, Marten.Metadata.IRevisioned
             Id = message.SagaId,
             TotalTicks = message.Count,
             Outstanding = [.. Enumerable.Range(0, message.Count)],
-            Payload = [.. Enumerable.Range(0, message.Count).Select(i => new TickPayload(
-                Id: Guid.NewGuid(),
-                Index: i,
-                Description: new string('x', 1024),
-                Note: $"tick {i} payload — random {Guid.NewGuid()}",
-                Tags: [.. Enumerable.Range(0, 8).Select(t => $"tag-{i}-{t}")]))],
         };
         return (saga, []);
     }
 
     public async Task<OutgoingMessages> Handle(TickOff message)
     {
+        Interlocked.Increment(ref HandleInvocationCount);
+
         // Hold the load → mutate → save window open long enough that concurrently-
         // dispatched handlers genuinely overlap.
         await Task.Delay(TimeSpan.FromMilliseconds(50));
@@ -261,6 +477,7 @@ public class TickOffSaga : Wolverine.Saga, Marten.Metadata.IRevisioned
         var index = message.Index;
         if (!Outstanding.Remove(index))
         {
+            Interlocked.Increment(ref HandleEarlyReturnCount);
             return [];
         }
 
@@ -275,9 +492,3 @@ public class TickOffSaga : Wolverine.Saga, Marten.Metadata.IRevisioned
     }
 }
 
-public sealed record TickPayload(
-    Guid Id,
-    int Index,
-    string Description,
-    string Note,
-    List<string> Tags);
